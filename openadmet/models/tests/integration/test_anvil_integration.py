@@ -145,15 +145,19 @@ class TestCPUPosthocConfigs:
         assert click_success(result)
 
 
-class _StopAfterValFeaturize(Exception):
-    pass
-
-
 @pytest.mark.cpu
-def test_dl_workflow_eval_splits_reuse_train_scaler(tmp_path, monkeypatch):
+def test_dl_workflow_eval_splits_reuse_train_scaler(tmp_path):
     """Val and test featurize calls must reuse the scaler fitted on the train
-    split, so normalized eval targets stay in train space."""
+    split, so normalized eval targets stay in train space.
+
+    Verifies via the artifacts a real run() writes: the saved val/test
+    dataloaders must contain targets normalized with a StandardScaler fit on
+    y_train, and must differ from a scaler refit on the eval targets.
+    """
     import numpy as np
+    import pandas as pd
+    import torch
+    from sklearn.preprocessing import StandardScaler
 
     from openadmet.models.anvil.specification import DataSpec, Metadata
     from openadmet.models.anvil.workflow import AnvilDeepLearningWorkflow
@@ -163,26 +167,7 @@ def test_dl_workflow_eval_splits_reuse_train_scaler(tmp_path, monkeypatch):
     from openadmet.models.tests.unit.datafiles import test_csv
     from openadmet.models.trainer.lightning import LightningTrainer
 
-    calls = []
-    real_featurize = ChemPropFeaturizer.featurize
-
-    def spy(self, smiles, y=None, train=False, **kwargs):
-        result = real_featurize(self, smiles, y=y, train=train, **kwargs)
-        calls.append(
-            {
-                "train": train,
-                "y": np.asarray(y) if y is not None else None,
-                "scaler_in": kwargs.get("target_scaler"),
-                "scaler_out": result[2],
-                "dataset": result[3],
-            }
-        )
-        if len(calls) == 2:
-            raise _StopAfterValFeaturize
-        return result
-
-    monkeypatch.setattr(ChemPropFeaturizer, "featurize", spy)
-
+    output_dir = tmp_path / "out"
     workflow = AnvilDeepLearningWorkflow(
         metadata=Metadata(
             version="v1",
@@ -202,24 +187,30 @@ def test_dl_workflow_eval_splits_reuse_train_scaler(tmp_path, monkeypatch):
             input_col="SMILES",
             target_cols=["data1"],
         ),
-        split=ShuffleSplitter(train_size=0.7, val_size=0.1, test_size=0.2),
+        split=ShuffleSplitter(
+            train_size=0.7, val_size=0.1, test_size=0.2, random_seed=42
+        ),
         feat=ChemPropFeaturizer(batch_size=4, n_jobs=0),
         model=ChemPropModel(),
-        trainer=LightningTrainer(),
+        trainer=LightningTrainer(max_epochs=1, accelerator="cpu"),
         evals=[],
         ensemble=None,
         transform=None,
     )
+    workflow.run(output_dir=output_dir)
 
-    with pytest.raises(_StopAfterValFeaturize):
-        workflow.run(output_dir=tmp_path / "out")
+    data_dir = output_dir / "data"
+    y_train = pd.read_csv(data_dir / "y_train.csv").to_numpy()
+    train_scaler = StandardScaler().fit(y_train)
 
-    train_call, val_call = calls
-    assert train_call["train"] is True
-
-    # The scaler handed to the val featurize must be the one fit on train
-    assert val_call["scaler_in"] is train_call["scaler_out"]
-
-    # Val targets in the dataset are transformed with train statistics
-    expected = train_call["scaler_out"].transform(val_call["y"].reshape(-1, 1))
-    assert val_call["dataset"].Y == pytest.approx(expected)
+    for split in ("val", "test"):
+        y_split = pd.read_csv(data_dir / f"y_{split}.csv").to_numpy()
+        dataloader = torch.load(
+            output_dir / f"{split}_dataloader.pth", weights_only=False
+        )
+        assert np.asarray(dataloader.dataset.Y) == pytest.approx(
+            train_scaler.transform(y_split), rel=1e-5
+        )
+        # A scaler refit on the eval targets would produce different values
+        refit = StandardScaler().fit_transform(y_split)
+        assert not np.allclose(dataloader.dataset.Y, refit)
